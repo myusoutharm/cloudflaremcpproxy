@@ -555,14 +555,32 @@ function validateEnv(env) {
   return null;
 }
 
+function handleDebugEnv(env) {
+  const allowedRedirectUris = getAllowedRedirectUris(env);
+  return jsonResponse({
+    mcp_origin_present: Boolean(env.MCP_ORIGIN),
+    oauth_client_id_present: Boolean(env.OAUTH_CLIENT_ID),
+    oauth_signing_secret_present: Boolean(env.OAUTH_SIGNING_SECRET),
+    oauth_allowed_redirect_uris_present: Boolean(env.OAUTH_ALLOWED_REDIRECT_URIS),
+    oauth_allowed_redirect_uris_count: allowedRedirectUris.length,
+    oauth_allowed_redirect_uris_values: allowedRedirectUris,
+    cf_service_token_id_present: Boolean(env.CF_SERVICE_TOKEN_ID),
+    cf_service_token_secret_present: Boolean(env.CF_SERVICE_TOKEN_SECRET),
+  });
+}
+
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/debug-env") {
+      return handleDebugEnv(env);
+    }
+
     const envError = validateEnv(env);
     if (envError) {
       return envError;
     }
-
-    const url = new URL(request.url);
 
     if (url.pathname === "/authorize" && (request.method === "GET" || request.method === "POST")) {
       return handleAuthorize(request, env);
