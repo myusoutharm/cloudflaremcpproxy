@@ -141,8 +141,16 @@ async function verifySignedToken(token, env, expectedType) {
 
   const [encodedHeader, encodedPayload, providedSignature] = parts;
   const signingInput = `${encodedHeader}.${encodedPayload}`;
-  const expectedSignature = await signValue(signingInput, env);
-  if (providedSignature !== expectedSignature) {
+
+  const key = await importSigningKey(env.OAUTH_SIGNING_SECRET);
+  const signatureBytes = base64UrlDecodeToBytes(providedSignature);
+  const isValid = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    signatureBytes,
+    new TextEncoder().encode(signingInput),
+  );
+  if (!isValid) {
     throw new Error("invalid_signature");
   }
 
@@ -469,26 +477,47 @@ async function handleTokenRequest(request, env) {
 async function verifyAccessToken(request, env) {
   const authHeader = request.headers.get("Authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) {
-    return null;
+    return { ok: false, reason: "missing_bearer" };
   }
 
   const token = authHeader.slice(7);
   try {
     const payload = await verifySignedToken(token, env, "access_token");
     if (payload.client_id !== env.OAUTH_CLIENT_ID) {
-      return null;
+      return { ok: false, reason: "client_id_mismatch", payload_client_id: payload.client_id ?? null };
     }
-    return payload;
+    return { ok: true, payload };
   } catch {
-    return null;
+    return { ok: false, reason: "invalid_or_expired_token" };
   }
 }
 
 async function handleMcpProxy(request, env) {
-  const accessTokenPayload = await verifyAccessToken(request, env);
-  if (!accessTokenPayload) {
-    return jsonResponse({ error: "unauthorized" }, 401);
+  const tokenCheck = await verifyAccessToken(request, env);
+  if (!tokenCheck.ok) {
+    console.log(JSON.stringify({
+      route: "/mcp",
+      method: request.method,
+      auth_ok: false,
+      reason: tokenCheck.reason,
+      has_authorization_header: request.headers.has("Authorization"),
+      has_session_id_header: request.headers.has("mcp-session-id"),
+      accept: request.headers.get("Accept"),
+      content_type: request.headers.get("Content-Type"),
+    }));
+        return jsonResponse({ error: "unauthorized" }, 401);
   }
+
+  console.log(JSON.stringify({
+    route: "/mcp",
+    method: request.method,
+    auth_ok: true,
+    client_id: tokenCheck.payload.client_id,
+    scope: tokenCheck.payload.scope ?? null,
+    has_session_id_header: request.headers.has("mcp-session-id"),
+    accept: request.headers.get("Accept"),
+    content_type: request.headers.get("Content-Type"),
+  }));
 
   const requestUrl = new URL(request.url);
   const targetUrl = new URL(requestUrl.pathname + requestUrl.search, env.MCP_ORIGIN);
@@ -501,7 +530,15 @@ async function handleMcpProxy(request, env) {
     duplex: "half",
   });
 
-  return fetch(proxiedRequest);
+  const upstreamResponse = await fetch(proxiedRequest);
+  console.log(JSON.stringify({
+    route: "/mcp",
+    method: request.method,
+    upstream_status: upstreamResponse.status,
+    upstream_content_type: upstreamResponse.headers.get("Content-Type"),
+    upstream_session_id: upstreamResponse.headers.get("mcp-session-id"),
+  }));
+  return upstreamResponse;
 }
 
 async function handleRegistration(request, env) {
@@ -520,9 +557,8 @@ async function handleRegistration(request, env) {
 
   return jsonResponse({
     client_id: env.OAUTH_CLIENT_ID,
-    client_secret: env.OAUTH_CLIENT_SECRET || undefined,
     redirect_uris: redirectUris,
-    token_endpoint_auth_method: env.OAUTH_CLIENT_SECRET ? "client_secret_post" : "none",
+    token_endpoint_auth_method: "none",
     grant_types: ["authorization_code", "refresh_token", "client_credentials"],
     response_types: ["code"],
   }, 201);
@@ -555,28 +591,12 @@ function validateEnv(env) {
   return null;
 }
 
-function handleDebugEnv(env) {
-  const allowedRedirectUris = getAllowedRedirectUris(env);
-  const envKeys = Object.keys(env).sort();
-  return jsonResponse({
-    env_keys: envKeys,
-    mcp_origin_present: Boolean(env.MCP_ORIGIN),
-    oauth_client_id_present: Boolean(env.OAUTH_CLIENT_ID),
-    oauth_signing_secret_present: Boolean(env.OAUTH_SIGNING_SECRET),
-    oauth_allowed_redirect_uris_present: Boolean(env.OAUTH_ALLOWED_REDIRECT_URIS),
-    oauth_allowed_redirect_uris_count: allowedRedirectUris.length,
-    oauth_allowed_redirect_uris_values: allowedRedirectUris,
-    cf_service_token_id_present: Boolean(env.CF_SERVICE_TOKEN_ID),
-    cf_service_token_secret_present: Boolean(env.CF_SERVICE_TOKEN_SECRET),
-  });
-}
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/debug-env") {
-      return handleDebugEnv(env);
+      return jsonResponse({ error: "not_found" }, 404);
     }
 
     const envError = validateEnv(env);
