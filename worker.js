@@ -557,7 +557,9 @@ function validateEnv(env) {
 
 function handleDebugEnv(env) {
   const allowedRedirectUris = getAllowedRedirectUris(env);
+  const envKeys = Object.keys(env).sort();
   return jsonResponse({
+    env_keys: envKeys,
     mcp_origin_present: Boolean(env.MCP_ORIGIN),
     oauth_client_id_present: Boolean(env.OAUTH_CLIENT_ID),
     oauth_signing_secret_present: Boolean(env.OAUTH_SIGNING_SECRET),
