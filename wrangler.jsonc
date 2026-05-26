@@ -1,5 +1,5 @@
 {
-  "name": "rda2-mcp-oauth-proxy",
+  "name": "cloudflaremcpproxy",
   "main": "worker.js",
   "compatibility_date": "2026-05-26"
 }
