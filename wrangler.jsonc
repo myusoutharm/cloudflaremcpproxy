@@ -3,19 +3,18 @@
   "main": "worker.js",
   "compatibility_date": "2026-05-26",
   "keep_vars": true,
-  "observability": {
-    "enabled": false,
-    "head_sampling_rate": 1,
-    "logs": {
-      "enabled": true,
-      "head_sampling_rate": 1,
-      "persist": true,
-      "invocation_logs": true
-    },
-    "traces": {
-      "enabled": false,
-      "persist": true,
-      "head_sampling_rate": 1
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "OAUTH_STATE",
+        "class_name": "OAuthState"
+      }
+    ]
+  },
+  "exports": {
+    "OAuthState": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
   }
 }

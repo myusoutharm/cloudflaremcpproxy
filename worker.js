@@ -1,60 +1,90 @@
+import { DurableObject } from "cloudflare:workers";
+
 /**
  * Cloudflare Worker OAuth proxy for remote MCP clients such as Claude and ChatGPT.
- *
- * Supported routes:
- * - GET/POST /authorize
- * - POST /oauth/token
- * - POST /register
- * - GET /.well-known/oauth-authorization-server
- * - GET /.well-known/openid-configuration
- * - /mcp
- *
- * Design notes:
- * - Uses signed self-contained auth codes / tokens so no KV or database is required.
- * - Supports authorization_code + PKCE for browser-based OAuth clients.
- * - Supports refresh_token and client_credentials for compatibility.
- * - Proxies MCP traffic to the protected upstream origin with Cloudflare Access headers.
+ * OAuth state is stored in a Durable Object so authorization codes are single-use
+ * and refresh tokens rotate with replay detection.
  */
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const HTML_HEADERS = { "Content-Type": "text/html; charset=utf-8" };
+const TOKEN_HEADERS = {
+  "Cache-Control": "no-store",
+  Pragma: "no-cache",
+};
+const AUTHORIZATION_HTML_HEADERS = {
+  ...TOKEN_HEADERS,
+  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+  "Referrer-Policy": "no-referrer",
+  "X-Frame-Options": "DENY",
+};
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
 const AUTH_CODE_TTL_SECONDS = 300;
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const PASSWORD_WINDOW_SECONDS = 15 * 60;
+const PASSWORD_FAILURE_LIMIT = 5;
+const MAX_FORM_BODY_BYTES = 16 * 1024;
+const ALLOWED_SCOPES = new Set(["mcp", "offline_access"]);
 
-function jsonResponse(body, status = 200) {
+/** Returns a JSON response with optional additional headers. */
+function jsonResponse(body, status = 200, additionalHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: JSON_HEADERS,
+    headers: { ...JSON_HEADERS, ...additionalHeaders },
   });
 }
 
+/** Returns a non-cacheable OAuth JSON response. */
+function oauthJsonResponse(body, status = 200, additionalHeaders = {}) {
+  return jsonResponse(body, status, { ...TOKEN_HEADERS, ...additionalHeaders });
+}
+
+/** Returns a non-cacheable HTML response. */
 function htmlResponse(body, status = 200) {
   return new Response(body, {
     status,
-    headers: HTML_HEADERS,
+    headers: { ...HTML_HEADERS, ...AUTHORIZATION_HTML_HEADERS },
   });
 }
 
-function getBaseUrl(request) {
-  return new URL(request.url).origin;
+/** Returns the configured HTTPS public origin of this Worker. */
+function getBaseUrl(env) {
+  return env.OAUTH_PUBLIC_ORIGIN;
 }
 
-function getOAuthMetadata(request) {
-  const base = getBaseUrl(request);
+/** Returns the canonical protected MCP resource URL. */
+function getCanonicalResource(env) {
+  return `${getBaseUrl(env)}/mcp`;
+}
+
+/** Builds OAuth metadata for the preconfigured confidential client. */
+function getOAuthMetadata(env) {
+  const baseUrl = getBaseUrl(env);
   return {
-    issuer: base,
-    authorization_endpoint: `${base}/authorize`,
-    token_endpoint: `${base}/oauth/token`,
-    registration_endpoint: `${base}/register`,
+    issuer: baseUrl,
+    authorization_endpoint: `${baseUrl}/authorize`,
+    token_endpoint: `${baseUrl}/oauth/token`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"],
-    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
-    code_challenge_methods_supported: ["S256", "plain"],
-    scopes_supported: ["mcp", "offline_access"],
+    token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: [...ALLOWED_SCOPES],
+    resource_indicators_supported: true,
   };
 }
 
+/** Builds RFC 9728 metadata for the protected MCP resource. */
+function getProtectedResourceMetadata(env) {
+  const baseUrl = getBaseUrl(env);
+  return {
+    resource: `${baseUrl}/mcp`,
+    authorization_servers: [baseUrl],
+    bearer_methods_supported: ["header"],
+    scopes_supported: [...ALLOWED_SCOPES],
+  };
+}
+
+/** Parses exact redirect URIs configured for OAuth clients. */
 function getAllowedRedirectUris(env) {
   return (env.OAUTH_ALLOWED_REDIRECT_URIS ?? "")
     .split(",")
@@ -62,11 +92,29 @@ function getAllowedRedirectUris(env) {
     .filter(Boolean);
 }
 
-function isAllowedRedirectUri(redirectUri, env) {
-  const allowedRedirectUris = getAllowedRedirectUris(env);
-  return allowedRedirectUris.length > 0 && allowedRedirectUris.includes(redirectUri);
+/** Checks whether a redirect URI uses HTTPS or a permitted loopback HTTP host. */
+function isSecureRedirectUri(value) {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password || url.hash) {
+      return false;
+    }
+    if (url.protocol === "https:") {
+      return true;
+    }
+    const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+    return url.protocol === "http:" && loopbackHosts.has(url.hostname);
+  } catch {
+    return false;
+  }
 }
 
+/** Checks a redirect URI against the exact configured allowlist. */
+function isAllowedRedirectUri(redirectUri, env) {
+  return isSecureRedirectUri(redirectUri) && getAllowedRedirectUris(env).includes(redirectUri);
+}
+
+/** Escapes text inserted into the authorization HTML page. */
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -76,6 +124,7 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+/** Encodes bytes using unpadded base64url. */
 function base64UrlEncodeBytes(bytes) {
   let binary = "";
   for (const byte of bytes) {
@@ -84,25 +133,28 @@ function base64UrlEncodeBytes(bytes) {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
+/** Encodes text using unpadded base64url. */
 function base64UrlEncodeText(value) {
   return base64UrlEncodeBytes(new TextEncoder().encode(value));
 }
 
+/** Decodes unpadded base64url into bytes. */
 function base64UrlDecodeToBytes(value) {
   const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((value.length + 3) % 4);
   const binary = atob(padded);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
   }
   return bytes;
 }
 
+/** Decodes base64url JSON content. */
 function base64UrlDecodeToJson(value) {
-  const bytes = base64UrlDecodeToBytes(value);
-  return JSON.parse(new TextDecoder().decode(bytes));
+  return JSON.parse(new TextDecoder().decode(base64UrlDecodeToBytes(value)));
 }
 
+/** Imports the access-token signing secret as an HMAC key. */
 async function importSigningKey(secret) {
   return crypto.subtle.importKey(
     "raw",
@@ -113,105 +165,125 @@ async function importSigningKey(secret) {
   );
 }
 
+/** Signs a JWT signing input with the configured HMAC key. */
 async function signValue(value, env) {
   const key = await importSigningKey(env.OAUTH_SIGNING_SECRET);
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
   return base64UrlEncodeBytes(new Uint8Array(signature));
 }
 
+/** Calculates an S256 PKCE challenge. */
 async function sha256Base64Url(value) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return base64UrlEncodeBytes(new Uint8Array(digest));
 }
 
-async function createSignedToken(payload, env) {
+/** Creates a cryptographically random opaque OAuth credential. */
+function createOpaqueToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncodeBytes(bytes);
+}
+
+/** Creates a signed access token bound to this Worker's MCP resource. */
+async function createAccessToken(clientId, scope, issuer, resource, env, familyId = null) {
+  const now = Math.floor(Date.now() / 1000);
   const header = { alg: "HS256", typ: "JWT" };
+  const payload = {
+    typ: "access_token",
+    iss: issuer,
+    aud: resource,
+    client_id: clientId,
+    scope,
+    iat: now,
+    exp: now + ACCESS_TOKEN_TTL_SECONDS,
+    jti: crypto.randomUUID(),
+  };
+  if (familyId) {
+    payload.family_id = familyId;
+  }
   const encodedHeader = base64UrlEncodeText(JSON.stringify(header));
   const encodedPayload = base64UrlEncodeText(JSON.stringify(payload));
   const signingInput = `${encodedHeader}.${encodedPayload}`;
-  const signature = await signValue(signingInput, env);
-  return `${signingInput}.${signature}`;
+  return `${signingInput}.${await signValue(signingInput, env)}`;
 }
 
-async function verifySignedToken(token, env, expectedType) {
-  const parts = token.split(".");
-  if (parts.length !== 3) {
-    throw new Error("invalid_token");
+/** Verifies an access token and all MCP authorization constraints. */
+async function verifyAccessToken(request, env) {
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const bearerMatch = authHeader.match(/^Bearer\s+(\S+)\s*$/i);
+  if (!bearerMatch) {
+    return { ok: false, reason: "missing_bearer" };
   }
 
-  const [encodedHeader, encodedPayload, providedSignature] = parts;
-  const signingInput = `${encodedHeader}.${encodedPayload}`;
+  try {
+    const token = bearerMatch[1];
+    const parts = token.split(".");
+    if (parts.length !== 3) {
+      throw new Error("invalid_token");
+    }
+    const [encodedHeader, encodedPayload, providedSignature] = parts;
+    const header = base64UrlDecodeToJson(encodedHeader);
+    if (header.alg !== "HS256" || header.typ !== "JWT") {
+      throw new Error("invalid_header");
+    }
 
-  const key = await importSigningKey(env.OAUTH_SIGNING_SECRET);
-  const signatureBytes = base64UrlDecodeToBytes(providedSignature);
-  const isValid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    signatureBytes,
-    new TextEncoder().encode(signingInput),
-  );
-  if (!isValid) {
-    throw new Error("invalid_signature");
-  }
+    const key = await importSigningKey(env.OAUTH_SIGNING_SECRET);
+    const signingInput = `${encodedHeader}.${encodedPayload}`;
+    const isValid = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      base64UrlDecodeToBytes(providedSignature),
+      new TextEncoder().encode(signingInput),
+    );
+    if (!isValid) {
+      throw new Error("invalid_signature");
+    }
 
-  const payload = base64UrlDecodeToJson(encodedPayload);
-  const now = Math.floor(Date.now() / 1000);
-  if (typeof payload.exp !== "number" || payload.exp < now) {
-    throw new Error("expired_token");
+    const payload = base64UrlDecodeToJson(encodedPayload);
+    const now = Math.floor(Date.now() / 1000);
+    const requiredScope = new Set(String(payload.scope ?? "").split(/\s+/));
+    if (
+      payload.typ !== "access_token"
+      || payload.exp <= now
+      || payload.iss !== getBaseUrl(env)
+      || payload.aud !== getCanonicalResource(env)
+      || payload.client_id !== env.OAUTH_CLIENT_ID
+      || !requiredScope.has("mcp")
+    ) {
+      throw new Error("invalid_claims");
+    }
+    if (payload.family_id && await getOAuthState(env).isFamilyRevoked(payload.family_id)) {
+      throw new Error("revoked_token_family");
+    }
+    return { ok: true, payload };
+  } catch {
+    return { ok: false, reason: "invalid_or_expired_token" };
   }
-  if (expectedType && payload.typ !== expectedType) {
-    throw new Error("invalid_token_type");
-  }
-  return payload;
 }
 
-function buildProxyHeaders(requestHeaders, env) {
-  const headers = new Headers(requestHeaders);
-  headers.set("CF-Access-Client-Id", env.CF_SERVICE_TOKEN_ID);
-  headers.set("CF-Access-Client-Secret", env.CF_SERVICE_TOKEN_SECRET);
-  headers.delete("host");
-  return headers;
+/** Returns a normalized requested scope string. */
+function getRequestedScope(value) {
+  return value?.trim().replace(/\s+/g, " ") || "mcp";
 }
 
+/** Checks that requested scopes are known and grant MCP access. */
+function isScopeValid(scope) {
+  const scopes = scope.split(" ").filter(Boolean);
+  return scopes.includes("mcp") && scopes.every((value) => ALLOWED_SCOPES.has(value));
+}
+
+/** Checks the configured static OAuth client ID. */
 function isClientIdValid(clientId, env) {
   return Boolean(clientId) && clientId === env.OAUTH_CLIENT_ID;
 }
 
+/** Checks the required confidential-client secret. */
 function isClientSecretValid(clientSecret, env) {
   return Boolean(clientSecret) && clientSecret === env.OAUTH_CLIENT_SECRET;
 }
 
-function getRequestedScope(value) {
-  return value?.trim() || "mcp";
-}
-
-async function issueAccessTokenTokenPair(clientId, scope, resource, env) {
-  const now = Math.floor(Date.now() / 1000);
-  const accessToken = await createSignedToken({
-    typ: "access_token",
-    client_id: clientId,
-    scope,
-    resource,
-    exp: now + ACCESS_TOKEN_TTL_SECONDS,
-  }, env);
-
-  const refreshToken = await createSignedToken({
-    typ: "refresh_token",
-    client_id: clientId,
-    scope,
-    resource,
-    exp: now + REFRESH_TOKEN_TTL_SECONDS,
-  }, env);
-
-  return {
-    access_token: accessToken,
-    token_type: "bearer",
-    expires_in: ACCESS_TOKEN_TTL_SECONDS,
-    refresh_token: refreshToken,
-    scope,
-  };
-}
-
+/** Builds a redirect URI while preserving any existing query and fragment. */
 function buildRedirectUri(redirectUri, params) {
   const url = new URL(redirectUri);
   for (const [key, value] of Object.entries(params)) {
@@ -222,25 +294,32 @@ function buildRedirectUri(redirectUri, params) {
   return url.toString();
 }
 
+/** Returns a standard non-cacheable OAuth error response. */
 function oauthErrorResponse(error, description, status = 400) {
-  return jsonResponse({
-    error,
-    error_description: description,
-  }, status);
+  return oauthJsonResponse({ error, error_description: description }, status);
 }
 
+/** Returns a non-cacheable redirect that always converts POST to GET. */
+function oauthRedirectResponse(location) {
+  return new Response(null, {
+    status: 303,
+    headers: { Location: location, ...TOKEN_HEADERS, "Referrer-Policy": "no-referrer" },
+  });
+}
+
+/** Redirects a validated OAuth client with an authorization error. */
 function oauthErrorRedirect(redirectUri, state, error, description) {
-  return Response.redirect(
+  return oauthRedirectResponse(
     buildRedirectUri(redirectUri, {
       error,
       error_description: description,
       state,
     }),
-    302,
   );
 }
 
-function renderAuthorizePage(query, requirePassword) {
+/** Renders the mandatory shared-password authorization page. */
+function renderAuthorizePage(query) {
   const hiddenFields = [
     "response_type",
     "client_id",
@@ -255,10 +334,6 @@ function renderAuthorizePage(query, requirePassword) {
     return `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`;
   }).join("");
 
-  const passwordField = requirePassword
-    ? '<label>Password <input type="password" name="user_password" required></label>'
-    : "";
-
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -271,17 +346,17 @@ function renderAuthorizePage(query, requirePassword) {
     h1 { font-size: 20px; margin: 0 0 12px; }
     p { line-height: 1.5; }
     label { display: block; margin: 16px 0; font-weight: 600; }
-    input[type="password"] { width: 100%; padding: 10px; margin-top: 8px; }
+    input[type="password"] { box-sizing: border-box; width: 100%; padding: 10px; margin-top: 8px; }
     button { background: #111; color: #fff; border: 0; border-radius: 8px; padding: 12px 18px; cursor: pointer; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Approve MCP Access</h1>
-    <p>This app wants access to your MCP proxy.</p>
+    <p>Enter the MCP authorization password to continue.</p>
     <form method="post" action="/authorize">
       ${hiddenFields}
-      ${passwordField}
+      <label>Password <input type="password" name="user_password" required autocomplete="current-password"></label>
       <button type="submit">Approve</button>
     </form>
   </div>
@@ -289,33 +364,341 @@ function renderAuthorizePage(query, requirePassword) {
 </html>`;
 }
 
-async function createAuthorizationCode(clientId, redirectUri, scope, resource, codeChallenge, codeChallengeMethod, env) {
-  const now = Math.floor(Date.now() / 1000);
-  return createSignedToken({
-    typ: "authorization_code",
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope,
-    resource,
-    code_challenge: codeChallenge,
-    code_challenge_method: codeChallengeMethod,
-    exp: now + AUTH_CODE_TTL_SECONDS,
-  }, env);
+/** Returns the single Durable Object used for OAuth credential state. */
+function getOAuthState(env) {
+  return env.OAUTH_STATE.getByName("global");
 }
 
+/** Stores and atomically consumes short-lived OAuth credentials. */
+export class OAuthState extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS authorization_codes (
+        token TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        token TEXT PRIMARY KEY,
+        family_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS revoked_families (
+        family_id TEXT PRIMARY KEY,
+        expires_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS password_attempts (
+        client_ip TEXT PRIMARY KEY,
+        window_started INTEGER NOT NULL,
+        failures INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS client_auth_attempts (
+        client_ip TEXT PRIMARY KEY,
+        window_started INTEGER NOT NULL,
+        failures INTEGER NOT NULL
+      );
+    `);
+  }
+
+  /** Stores an opaque authorization code and its PKCE constraints. */
+  storeAuthorizationCode(token, payload) {
+    const now = Math.floor(Date.now() / 1000);
+    this.sql.exec("DELETE FROM authorization_codes WHERE expires_at <= ?", now);
+    this.sql.exec(
+      "INSERT INTO authorization_codes (token, payload, expires_at) VALUES (?, ?, ?)",
+      token,
+      JSON.stringify(payload),
+      payload.exp,
+    );
+  }
+
+  /** Exchanges an authorization code and stores its first refresh token atomically. */
+  exchangeAuthorizationCode(token, expected, refreshToken) {
+    return this.ctx.storage.transactionSync(() => {
+      const now = Math.floor(Date.now() / 1000);
+      this.sql.exec("DELETE FROM refresh_tokens WHERE expires_at <= ?", now);
+      const row = this.sql.exec(
+        "SELECT payload, expires_at, used FROM authorization_codes WHERE token = ?",
+        token,
+      ).toArray()[0];
+      if (!row || row.expires_at <= now) {
+        return { status: "invalid" };
+      }
+
+      const payload = JSON.parse(row.payload);
+      if (
+        payload.client_id !== expected.client_id
+        || payload.redirect_uri !== expected.redirect_uri
+        || payload.resource !== expected.resource
+        || payload.code_challenge !== expected.code_challenge
+      ) {
+        return { status: "invalid" };
+      }
+      if (row.used) {
+        this.sql.exec(
+          "INSERT OR REPLACE INTO revoked_families (family_id, expires_at) VALUES (?, ?)",
+          payload.family_id,
+          now + REFRESH_TOKEN_TTL_SECONDS,
+        );
+        return { status: "replayed" };
+      }
+      const refreshPayload = {
+        client_id: payload.client_id,
+        scope: payload.scope,
+        resource: payload.resource,
+        exp: now + REFRESH_TOKEN_TTL_SECONDS,
+      };
+      this.sql.exec("UPDATE authorization_codes SET used = 1 WHERE token = ?", token);
+      this.sql.exec(
+        "INSERT INTO refresh_tokens (token, family_id, payload, expires_at) VALUES (?, ?, ?, ?)",
+        refreshToken,
+        payload.family_id,
+        JSON.stringify(refreshPayload),
+        refreshPayload.exp,
+      );
+      return { status: "consumed", payload };
+    });
+  }
+
+  /** Rotates a refresh token atomically and revokes its family on replay. */
+  rotateRefreshToken(token, expected, replacementToken) {
+    return this.ctx.storage.transactionSync(() => {
+      const now = Math.floor(Date.now() / 1000);
+      this.sql.exec("DELETE FROM refresh_tokens WHERE expires_at <= ?", now);
+      const row = this.sql.exec(
+        "SELECT family_id, payload, expires_at, used FROM refresh_tokens WHERE token = ?",
+        token,
+      ).toArray()[0];
+      if (!row || row.expires_at <= now) {
+        return null;
+      }
+      if (row.used) {
+        this.sql.exec(
+          "INSERT OR REPLACE INTO revoked_families (family_id, expires_at) VALUES (?, ?)",
+          row.family_id,
+          now + REFRESH_TOKEN_TTL_SECONDS,
+        );
+        return null;
+      }
+
+      const revoked = this.sql.exec(
+        "SELECT 1 FROM revoked_families WHERE family_id = ?",
+        row.family_id,
+      ).toArray().length > 0;
+      const payload = JSON.parse(row.payload);
+      if (
+        revoked
+        || payload.client_id !== expected.client_id
+        || payload.resource !== expected.resource
+      ) {
+        return null;
+      }
+      const originalScopes = new Set(payload.scope.split(" "));
+      const requestedScope = expected.scope || payload.scope;
+      const requestedScopes = requestedScope.split(" ");
+      if (requestedScopes.some((scope) => !originalScopes.has(scope))) {
+        return { status: "invalid_scope" };
+      }
+      const replacementPayload = {
+        ...payload,
+        scope: requestedScope,
+        exp: now + REFRESH_TOKEN_TTL_SECONDS,
+      };
+      this.sql.exec("UPDATE refresh_tokens SET used = 1 WHERE token = ?", token);
+      this.sql.exec(
+        "INSERT INTO refresh_tokens (token, family_id, payload, expires_at) VALUES (?, ?, ?, ?)",
+        replacementToken,
+        row.family_id,
+        JSON.stringify(replacementPayload),
+        replacementPayload.exp,
+      );
+      return { status: "rotated", family_id: row.family_id, payload: replacementPayload };
+    });
+  }
+
+  /** Checks whether an OAuth token family has been revoked. */
+  isFamilyRevoked(familyId) {
+    const now = Math.floor(Date.now() / 1000);
+    this.sql.exec("DELETE FROM revoked_families WHERE expires_at <= ?", now);
+    return this.sql.exec(
+      "SELECT 1 FROM revoked_families WHERE family_id = ?",
+      familyId,
+    ).toArray().length > 0;
+  }
+
+  /** Applies a per-IP failure limit to one of the credential tables. */
+  recordCredentialAttempt(tableName, clientIp, credentialCorrect) {
+    const allowedTables = new Set(["password_attempts", "client_auth_attempts"]);
+    if (!allowedTables.has(tableName)) {
+      throw new Error("invalid_attempt_table");
+    }
+    return this.ctx.storage.transactionSync(() => {
+      const now = Math.floor(Date.now() / 1000);
+      this.sql.exec(
+        `DELETE FROM ${tableName} WHERE window_started + ? <= ?`,
+        PASSWORD_WINDOW_SECONDS,
+        now,
+      );
+      if (credentialCorrect) {
+        this.sql.exec(`DELETE FROM ${tableName} WHERE client_ip = ?`, clientIp);
+        return { blocked: false };
+      }
+
+      const row = this.sql.exec(
+        `SELECT window_started, failures FROM ${tableName} WHERE client_ip = ?`,
+        clientIp,
+      ).toArray()[0];
+      if (!row || row.window_started + PASSWORD_WINDOW_SECONDS <= now) {
+        this.sql.exec(
+          `INSERT OR REPLACE INTO ${tableName} (client_ip, window_started, failures) VALUES (?, ?, 1)`,
+          clientIp,
+          now,
+        );
+        return { blocked: false };
+      }
+      if (row.failures >= PASSWORD_FAILURE_LIMIT) {
+        return { blocked: true };
+      }
+      this.sql.exec(
+        `UPDATE ${tableName} SET failures = failures + 1 WHERE client_ip = ?`,
+        clientIp,
+      );
+      return { blocked: false };
+    });
+  }
+
+  /** Applies a per-IP failure limit to the shared authorization password. */
+  recordPasswordAttempt(clientIp, passwordCorrect) {
+    return this.recordCredentialAttempt("password_attempts", clientIp, passwordCorrect);
+  }
+
+  /** Applies a per-IP failure limit to confidential-client authentication. */
+  recordClientAuthAttempt(clientIp, credentialsCorrect) {
+    return this.recordCredentialAttempt("client_auth_attempts", clientIp, credentialsCorrect);
+  }
+
+  /** Checks whether an IP is currently blocked for one credential type. */
+  isCredentialBlocked(tableName, clientIp) {
+    const allowedTables = new Set(["password_attempts", "client_auth_attempts"]);
+    if (!allowedTables.has(tableName)) {
+      throw new Error("invalid_attempt_table");
+    }
+    const now = Math.floor(Date.now() / 1000);
+    this.sql.exec(
+      `DELETE FROM ${tableName} WHERE window_started + ? <= ?`,
+      PASSWORD_WINDOW_SECONDS,
+      now,
+    );
+    const row = this.sql.exec(
+      `SELECT failures FROM ${tableName} WHERE client_ip = ?`,
+      clientIp,
+    ).toArray()[0];
+    return Boolean(row && row.failures >= PASSWORD_FAILURE_LIMIT);
+  }
+
+  /** Checks whether an IP is blocked from authorization-password attempts. */
+  isPasswordBlocked(clientIp) {
+    return this.isCredentialBlocked("password_attempts", clientIp);
+  }
+
+  /** Checks whether an IP is blocked from confidential-client attempts. */
+  isClientAuthBlocked(clientIp) {
+    return this.isCredentialBlocked("client_auth_attempts", clientIp);
+  }
+}
+
+/** Builds an access-token response for a refresh token already stored atomically. */
+async function buildAccessTokenPair(clientId, scope, resource, env, familyId, refreshToken) {
+  const issuer = getBaseUrl(env);
+  const accessToken = await createAccessToken(clientId, scope, issuer, resource, env, familyId);
+  return {
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: ACCESS_TOKEN_TTL_SECONDS,
+    refresh_token: refreshToken,
+    scope,
+  };
+}
+
+/** Parses a size-limited application/x-www-form-urlencoded request body. */
+async function parseUrlEncodedForm(request) {
+  const contentType = request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/x-www-form-urlencoded") {
+    return { error: "Expected application/x-www-form-urlencoded request body.", status: 415 };
+  }
+  const contentLength = Number(request.headers.get("Content-Length") ?? 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_FORM_BODY_BYTES) {
+    return { error: "Request body is too large.", status: 413 };
+  }
+
+  const reader = request.body?.getReader();
+  if (!reader) {
+    return { body: new URLSearchParams() };
+  }
+  const chunks = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    totalBytes += value.byteLength;
+    if (totalBytes > MAX_FORM_BODY_BYTES) {
+      await reader.cancel();
+      return { error: "Request body is too large.", status: 413 };
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { body: new URLSearchParams(new TextDecoder().decode(bytes)) };
+}
+
+/** Checks the fixed-length base64url grammar of an S256 challenge. */
+function isPkceChallengeValid(value) {
+  return /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+/** Checks RFC 7636 verifier length and unreserved-character grammar. */
+function isPkceVerifierValid(value) {
+  return /^[A-Za-z0-9\-._~]{43,128}$/.test(value);
+}
+
+/** Validates an authorization request and requires password approval. */
 async function handleAuthorize(request, env) {
   const url = new URL(request.url);
-  const query = request.method === "GET"
-    ? url.searchParams
-    : await request.formData();
-
+  let query = url.searchParams;
+  if (request.method === "POST") {
+    if (request.headers.get("Origin") !== env.OAUTH_PUBLIC_ORIGIN) {
+      return oauthErrorResponse("invalid_request", "Authorization POST must be same-origin.", 403);
+    }
+    const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    if (await getOAuthState(env).isPasswordBlocked(clientIp)) {
+      return htmlResponse("<h1>Too Many Attempts</h1><p>Try again later.</p>", 429);
+    }
+    const parsed = await parseUrlEncodedForm(request);
+    if (!parsed.body) {
+      return oauthErrorResponse("invalid_request", parsed.error, parsed.status);
+    }
+    query = parsed.body;
+  }
   const responseType = query.get("response_type") ?? "";
   const clientId = query.get("client_id") ?? "";
   const redirectUri = query.get("redirect_uri") ?? "";
   const scope = getRequestedScope(query.get("scope"));
   const state = query.get("state") ?? "";
   const codeChallenge = query.get("code_challenge") ?? "";
-  const codeChallengeMethod = query.get("code_challenge_method") ?? "plain";
+  const codeChallengeMethod = query.get("code_challenge_method") ?? "";
   const resource = query.get("resource") ?? "";
 
   if (responseType !== "code") {
@@ -327,171 +710,243 @@ async function handleAuthorize(request, env) {
   if (!redirectUri || !isAllowedRedirectUri(redirectUri, env)) {
     return oauthErrorResponse("invalid_request", "redirect_uri is missing or not allowed.");
   }
-  if (!codeChallenge) {
-    return oauthErrorRedirect(redirectUri, state, "invalid_request", "code_challenge is required.");
+  if (!isScopeValid(scope)) {
+    return oauthErrorRedirect(redirectUri, state, "invalid_scope", "Requested scope is not allowed.");
   }
-  if (!["S256", "plain"].includes(codeChallengeMethod)) {
-    return oauthErrorRedirect(redirectUri, state, "invalid_request", "Unsupported code_challenge_method.");
+  if (resource !== getCanonicalResource(env)) {
+    return oauthErrorRedirect(redirectUri, state, "invalid_target", "resource must identify this MCP server.");
   }
-
-  const requirePassword = Boolean(env.OAUTH_USER_PASSWORD);
-  const autoApprove = (env.OAUTH_AUTO_APPROVE ?? "true").toLowerCase() === "true";
-  const shouldRenderApprovalPage = request.method === "GET" && (!autoApprove || requirePassword);
-
-  if (shouldRenderApprovalPage) {
-    return htmlResponse(renderAuthorizePage(url.searchParams, requirePassword));
+  if (!isPkceChallengeValid(codeChallenge) || codeChallengeMethod !== "S256") {
+    return oauthErrorRedirect(redirectUri, state, "invalid_request", "S256 PKCE is required.");
+  }
+  if (request.method === "GET") {
+    return htmlResponse(renderAuthorizePage(url.searchParams));
   }
 
-  if (request.method === "POST" && requirePassword) {
-    const submittedPassword = query.get("user_password") ?? "";
-    if (submittedPassword !== env.OAUTH_USER_PASSWORD) {
-      return htmlResponse("<h1>Unauthorized</h1><p>Invalid password.</p>", 401);
-    }
+  const submittedPassword = query.get("user_password") ?? "";
+  const passwordCorrect = submittedPassword === env.OAUTH_USER_PASSWORD;
+  const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const attempt = await getOAuthState(env).recordPasswordAttempt(clientIp, passwordCorrect);
+  if (attempt.blocked) {
+    return htmlResponse("<h1>Too Many Attempts</h1><p>Try again later.</p>", 429);
+  }
+  if (!passwordCorrect) {
+    return htmlResponse("<h1>Unauthorized</h1><p>Invalid password.</p>", 401);
   }
 
-  const code = await createAuthorizationCode(
-    clientId,
-    redirectUri,
+  const now = Math.floor(Date.now() / 1000);
+  const code = createOpaqueToken();
+  await getOAuthState(env).storeAuthorizationCode(code, {
+    client_id: clientId,
+    redirect_uri: redirectUri,
     scope,
     resource,
-    codeChallenge,
-    codeChallengeMethod,
-    env,
-  );
-
-  return Response.redirect(
-    buildRedirectUri(redirectUri, { code, state }),
-    302,
-  );
+    code_challenge: codeChallenge,
+    family_id: crypto.randomUUID(),
+    exp: now + AUTH_CODE_TTL_SECONDS,
+  });
+  return oauthRedirectResponse(buildRedirectUri(redirectUri, { code, state }));
 }
 
-async function handleAuthorizationCodeGrant(body, env) {
-  const clientId = body.get("client_id") ?? "";
-  const clientSecret = body.get("client_secret") ?? "";
+/** Parses one confidential-client authentication method from a token request. */
+function getClientAuthentication(request, body) {
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const formClientId = body.get("client_id") ?? "";
+  const formClientSecret = body.get("client_secret") ?? "";
+  if (!authHeader) {
+    return { client_id: formClientId, client_secret: formClientSecret, method: "client_secret_post" };
+  }
+  const basicMatch = authHeader.match(/^Basic\s+(\S+)\s*$/i);
+  if (!basicMatch || formClientSecret) {
+    return null;
+  }
+
+  try {
+    const decoded = atob(basicMatch[1]);
+    const separatorIndex = decoded.indexOf(":");
+    if (separatorIndex < 0) {
+      return null;
+    }
+    const clientId = decodeURIComponent(decoded.slice(0, separatorIndex).replaceAll("+", " "));
+    const clientSecret = decodeURIComponent(decoded.slice(separatorIndex + 1).replaceAll("+", " "));
+    if (formClientId && formClientId !== clientId) {
+      return null;
+    }
+    return { client_id: clientId, client_secret: clientSecret, method: "client_secret_basic" };
+  } catch {
+    return null;
+  }
+}
+
+/** Exchanges a single-use authorization code for tokens. */
+async function handleAuthorizationCodeGrant(body, clientAuth, env) {
+  const clientId = clientAuth.client_id;
   const code = body.get("code") ?? "";
   const redirectUri = body.get("redirect_uri") ?? "";
   const codeVerifier = body.get("code_verifier") ?? "";
-
-  if (!isClientIdValid(clientId, env)) {
-    return oauthErrorResponse("invalid_client", "Unknown client_id.", 401);
+  const resource = body.get("resource") ?? "";
+  if (!code || !redirectUri || !codeVerifier || !resource) {
+    return oauthErrorResponse("invalid_request", "code, redirect_uri, code_verifier, and resource are required.");
   }
-  if (!code || !redirectUri || !codeVerifier) {
-    return oauthErrorResponse("invalid_request", "code, redirect_uri, and code_verifier are required.");
+  if (resource !== getCanonicalResource(env)) {
+    return oauthErrorResponse("invalid_target", "resource must identify this MCP server.");
   }
-
-  let payload;
-  try {
-    payload = await verifySignedToken(code, env, "authorization_code");
-  } catch {
-    return oauthErrorResponse("invalid_grant", "Authorization code is invalid or expired.", 401);
+  if (!isPkceVerifierValid(codeVerifier)) {
+    return oauthErrorResponse("invalid_request", "code_verifier does not meet RFC 7636 requirements.");
   }
 
-  if (payload.client_id !== clientId || payload.redirect_uri !== redirectUri) {
-    return oauthErrorResponse("invalid_grant", "Authorization code does not match client or redirect URI.", 401);
+  const codeChallenge = await sha256Base64Url(codeVerifier);
+  const refreshToken = createOpaqueToken();
+  const consumed = await getOAuthState(env).exchangeAuthorizationCode(code, {
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    resource,
+    code_challenge: codeChallenge,
+  }, refreshToken);
+  if (consumed.status !== "consumed") {
+    return oauthErrorResponse("invalid_grant", "Authorization code is invalid, expired, or already used.");
   }
-
-  if (clientSecret && !isClientSecretValid(clientSecret, env)) {
-    return oauthErrorResponse("invalid_client", "Invalid client_secret.", 401);
-  }
-
-  const expectedChallenge = payload.code_challenge_method === "S256"
-    ? await sha256Base64Url(codeVerifier)
-    : codeVerifier;
-
-  if (expectedChallenge !== payload.code_challenge) {
-    return oauthErrorResponse("invalid_grant", "PKCE verification failed.", 401);
-  }
-
-  return jsonResponse(await issueAccessTokenTokenPair(
+  return oauthJsonResponse(await buildAccessTokenPair(
     clientId,
-    payload.scope ?? "mcp",
-    payload.resource ?? "",
+    consumed.payload.scope,
+    resource,
     env,
+    consumed.payload.family_id,
+    refreshToken,
   ));
 }
 
-async function handleRefreshTokenGrant(body, env) {
-  const clientId = body.get("client_id") ?? "";
-  const clientSecret = body.get("client_secret") ?? "";
+/** Rotates a refresh token and rejects replayed token families. */
+async function handleRefreshTokenGrant(body, clientAuth, env) {
+  const clientId = clientAuth.client_id;
   const refreshToken = body.get("refresh_token") ?? "";
-
-  if (!isClientIdValid(clientId, env)) {
-    return oauthErrorResponse("invalid_client", "Unknown client_id.", 401);
+  const resource = body.get("resource") ?? "";
+  const requestedScopeValue = body.get("scope");
+  const requestedScope = requestedScopeValue === null ? null : getRequestedScope(requestedScopeValue);
+  if (!refreshToken || !resource) {
+    return oauthErrorResponse("invalid_request", "refresh_token and resource are required.");
   }
-  if (clientSecret && !isClientSecretValid(clientSecret, env)) {
-    return oauthErrorResponse("invalid_client", "Invalid client_secret.", 401);
+  if (resource !== getCanonicalResource(env)) {
+    return oauthErrorResponse("invalid_target", "resource must identify this MCP server.");
   }
-
-  let payload;
-  try {
-    payload = await verifySignedToken(refreshToken, env, "refresh_token");
-  } catch {
-    return oauthErrorResponse("invalid_grant", "Refresh token is invalid or expired.", 401);
+  if (requestedScope !== null && !isScopeValid(requestedScope)) {
+    return oauthErrorResponse("invalid_scope", "Requested scope is not allowed.");
   }
 
-  if (payload.client_id !== clientId) {
-    return oauthErrorResponse("invalid_grant", "Refresh token client mismatch.", 401);
+  const replacementToken = createOpaqueToken();
+  const consumed = await getOAuthState(env).rotateRefreshToken(refreshToken, {
+    client_id: clientId,
+    resource,
+    scope: requestedScope,
+  }, replacementToken);
+  if (!consumed) {
+    return oauthErrorResponse("invalid_grant", "Refresh token is invalid, expired, reused, or revoked.");
   }
-
-  return jsonResponse(await issueAccessTokenTokenPair(
+  if (consumed.status === "invalid_scope") {
+    return oauthErrorResponse("invalid_scope", "Requested scope exceeds the original grant.");
+  }
+  return oauthJsonResponse(await buildAccessTokenPair(
     clientId,
-    payload.scope ?? "mcp",
-    payload.resource ?? "",
+    consumed.payload.scope,
+    resource,
     env,
+    consumed.family_id,
+    replacementToken,
   ));
 }
 
-async function handleClientCredentialsGrant(body, env) {
-  const clientId = body.get("client_id") ?? "";
-  const clientSecret = body.get("client_secret") ?? "";
+/** Issues a short-lived access token for an authenticated machine client. */
+async function handleClientCredentialsGrant(body, clientAuth, env) {
+  const clientId = clientAuth.client_id;
   const scope = getRequestedScope(body.get("scope"));
   const resource = body.get("resource") ?? "";
-
-  if (!isClientIdValid(clientId, env) || !isClientSecretValid(clientSecret, env)) {
-    return oauthErrorResponse("invalid_client", "client_id or client_secret is invalid.", 401);
+  if (!isScopeValid(scope) || scope.includes("offline_access")) {
+    return oauthErrorResponse("invalid_scope", "Client credentials supports only the mcp scope.");
+  }
+  if (resource !== getCanonicalResource(env)) {
+    return oauthErrorResponse("invalid_target", "resource must identify this MCP server.");
   }
 
-  return jsonResponse(await issueAccessTokenTokenPair(clientId, scope, resource, env));
+  const accessToken = await createAccessToken(clientId, scope, getBaseUrl(env), resource, env);
+  return oauthJsonResponse({
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: ACCESS_TOKEN_TTL_SECONDS,
+    scope,
+  });
 }
 
+/** Dispatches supported OAuth token grants. */
 async function handleTokenRequest(request, env) {
-  const body = await request.formData().catch(() => null);
-  if (!body) {
-    return oauthErrorResponse("invalid_request", "Expected application/x-www-form-urlencoded request body.");
+  const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  if (await getOAuthState(env).isClientAuthBlocked(clientIp)) {
+    return oauthErrorResponse("invalid_client", "Too many failed client authentication attempts.", 429);
+  }
+  const parsed = await parseUrlEncodedForm(request);
+  if (!parsed.body) {
+    return oauthErrorResponse("invalid_request", parsed.error, parsed.status);
+  }
+  const body = parsed.body;
+  const clientAuth = getClientAuthentication(request, body);
+  const credentialsCorrect = Boolean(clientAuth)
+    && isClientIdValid(clientAuth.client_id, env)
+    && isClientSecretValid(clientAuth.client_secret, env);
+  const attempt = await getOAuthState(env).recordClientAuthAttempt(clientIp, credentialsCorrect);
+  if (attempt.blocked) {
+    return oauthErrorResponse("invalid_client", "Too many failed client authentication attempts.", 429);
+  }
+  if (!credentialsCorrect) {
+    const challenge = /^Basic\s/i.test(request.headers.get("Authorization") ?? "")
+      ? { "WWW-Authenticate": "Basic realm=\"oauth-token\"" }
+      : {};
+    return oauthJsonResponse({
+      error: "invalid_client",
+      error_description: "Client authentication failed.",
+    }, 401, challenge);
   }
 
   const grantType = body.get("grant_type") ?? "";
   if (grantType === "authorization_code") {
-    return handleAuthorizationCodeGrant(body, env);
+    return handleAuthorizationCodeGrant(body, clientAuth, env);
   }
   if (grantType === "refresh_token") {
-    return handleRefreshTokenGrant(body, env);
+    return handleRefreshTokenGrant(body, clientAuth, env);
   }
   if (grantType === "client_credentials") {
-    return handleClientCredentialsGrant(body, env);
+    return handleClientCredentialsGrant(body, clientAuth, env);
   }
-
   return oauthErrorResponse("unsupported_grant_type", "Unsupported grant_type.");
 }
 
-async function verifyAccessToken(request, env) {
-  const authHeader = request.headers.get("Authorization") ?? "";
-  if (!authHeader.startsWith("Bearer ")) {
-    return { ok: false, reason: "missing_bearer" };
-  }
-
-  const token = authHeader.slice(7);
-  try {
-    const payload = await verifySignedToken(token, env, "access_token");
-    if (payload.client_id !== env.OAUTH_CLIENT_ID) {
-      return { ok: false, reason: "client_id_mismatch", payload_client_id: payload.client_id ?? null };
-    }
-    return { ok: true, payload };
-  } catch {
-    return { ok: false, reason: "invalid_or_expired_token" };
-  }
+/** Returns an MCP 401 response with RFC 9728 discovery metadata. */
+function unauthorizedMcpResponse(env) {
+  const metadataUrl = `${getBaseUrl(env)}/.well-known/oauth-protected-resource`;
+  return jsonResponse(
+    { error: "unauthorized" },
+    401,
+    { "WWW-Authenticate": `Bearer resource_metadata="${metadataUrl}"` },
+  );
 }
 
+/** Builds the trusted Worker-to-origin header set. */
+function buildProxyHeaders(requestHeaders, env) {
+  const headers = new Headers(requestHeaders);
+  for (const name of [
+    "Authorization",
+    "Cookie",
+    "CF-Access-Jwt-Assertion",
+    "CF-Access-Authenticated-User-Email",
+    "Origin",
+  ]) {
+    headers.delete(name);
+  }
+  headers.set("CF-Access-Client-Id", env.CF_SERVICE_TOKEN_ID);
+  headers.set("CF-Access-Client-Secret", env.CF_SERVICE_TOKEN_SECRET);
+  headers.delete("host");
+  return headers;
+}
+
+/** Proxies an authenticated MCP request through Cloudflare Access. */
 async function handleMcpProxy(request, env) {
   const tokenCheck = await verifyAccessToken(request, env);
   if (!tokenCheck.ok) {
@@ -502,77 +957,50 @@ async function handleMcpProxy(request, env) {
       reason: tokenCheck.reason,
       has_authorization_header: request.headers.has("Authorization"),
       has_session_id_header: request.headers.has("mcp-session-id"),
-      accept: request.headers.get("Accept"),
-      content_type: request.headers.get("Content-Type"),
     }));
-        return jsonResponse({ error: "unauthorized" }, 401);
+    return unauthorizedMcpResponse(env);
   }
-
-  console.log(JSON.stringify({
-    route: "/mcp",
-    method: request.method,
-    auth_ok: true,
-    client_id: tokenCheck.payload.client_id,
-    scope: tokenCheck.payload.scope ?? null,
-    has_session_id_header: request.headers.has("mcp-session-id"),
-    accept: request.headers.get("Accept"),
-    content_type: request.headers.get("Content-Type"),
-  }));
 
   const requestUrl = new URL(request.url);
   const targetUrl = new URL(requestUrl.pathname + requestUrl.search, env.MCP_ORIGIN);
   const method = request.method.toUpperCase();
-
   const proxiedRequest = new Request(targetUrl.toString(), {
     method,
     headers: buildProxyHeaders(request.headers, env),
     body: method === "GET" || method === "HEAD" ? undefined : request.body,
     duplex: "half",
+    redirect: "manual",
   });
-
   const upstreamResponse = await fetch(proxiedRequest);
+  if (upstreamResponse.status >= 300 && upstreamResponse.status < 400) {
+    console.error("MCP origin returned an unexpected redirect", upstreamResponse.status);
+    return jsonResponse({ error: "unexpected_upstream_redirect" }, 502);
+  }
   console.log(JSON.stringify({
     route: "/mcp",
     method: request.method,
+    auth_ok: true,
+    client_id: tokenCheck.payload.client_id,
     upstream_status: upstreamResponse.status,
-    upstream_content_type: upstreamResponse.headers.get("Content-Type"),
-    upstream_session_id: upstreamResponse.headers.get("mcp-session-id"),
+    has_upstream_session_id: upstreamResponse.headers.has("mcp-session-id"),
   }));
   return upstreamResponse;
 }
 
-async function handleRegistration(request, env) {
-  if (request.method !== "POST") {
-    return oauthErrorResponse("invalid_request", "Use POST for client registration.");
-  }
-
-  const body = await request.json().catch(() => ({}));
-  const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
-  const allowedRedirectUris = getAllowedRedirectUris(env);
-
-  const invalidRedirectUri = redirectUris.find((uri) => !allowedRedirectUris.includes(uri));
-  if (invalidRedirectUri) {
-    return oauthErrorResponse("invalid_client_metadata", `Redirect URI not allowed: ${invalidRedirectUri}`);
-  }
-
-  return jsonResponse({
-    client_id: env.OAUTH_CLIENT_ID,
-    redirect_uris: redirectUris,
-    token_endpoint_auth_method: "none",
-    grant_types: ["authorization_code", "refresh_token", "client_credentials"],
-    response_types: ["code"],
-  }, 201);
-}
-
+/** Validates all required Worker bindings and security-sensitive URLs. */
 function validateEnv(env) {
   const required = [
     "MCP_ORIGIN",
+    "OAUTH_PUBLIC_ORIGIN",
     "CF_SERVICE_TOKEN_ID",
     "CF_SERVICE_TOKEN_SECRET",
     "OAUTH_CLIENT_ID",
+    "OAUTH_CLIENT_SECRET",
     "OAUTH_SIGNING_SECRET",
+    "OAUTH_USER_PASSWORD",
+    "OAUTH_ALLOWED_REDIRECT_URIS",
+    "OAUTH_STATE",
   ];
-
   const missing = required.filter((key) => !env[key]);
   if (missing.length > 0) {
     return jsonResponse({
@@ -581,53 +1009,102 @@ function validateEnv(env) {
     }, 500);
   }
 
-  if (getAllowedRedirectUris(env).length === 0) {
+  try {
+    const origin = new URL(env.MCP_ORIGIN);
+    if (
+      origin.protocol !== "https:"
+      || origin.username
+      || origin.password
+      || origin.pathname !== "/"
+      || origin.search
+      || origin.hash
+    ) {
+      throw new Error("invalid_origin");
+    }
+  } catch {
     return jsonResponse({
       error: "server_misconfigured",
-      error_description: "Set OAUTH_ALLOWED_REDIRECT_URIS to one or more exact callback URLs.",
+      error_description: "MCP_ORIGIN must be an HTTPS origin without credentials, path, query, or fragment.",
     }, 500);
   }
 
+  try {
+    const publicOrigin = new URL(env.OAUTH_PUBLIC_ORIGIN);
+    if (
+      publicOrigin.protocol !== "https:"
+      || publicOrigin.username
+      || publicOrigin.password
+      || publicOrigin.pathname !== "/"
+      || publicOrigin.search
+      || publicOrigin.hash
+      || publicOrigin.origin !== env.OAUTH_PUBLIC_ORIGIN
+    ) {
+      throw new Error("invalid_public_origin");
+    }
+  } catch {
+    return jsonResponse({
+      error: "server_misconfigured",
+      error_description: "OAUTH_PUBLIC_ORIGIN must be an HTTPS origin without credentials, path, trailing slash, query, or fragment.",
+    }, 500);
+  }
+
+  const invalidRedirectUri = getAllowedRedirectUris(env).find((uri) => !isSecureRedirectUri(uri));
+  if (invalidRedirectUri) {
+    return jsonResponse({
+      error: "server_misconfigured",
+      error_description: `Redirect URI must use HTTPS or loopback HTTP: ${invalidRedirectUri}`,
+    }, 500);
+  }
+  if (env.OAUTH_SIGNING_SECRET.length < 32 || env.OAUTH_USER_PASSWORD.length < 20) {
+    return jsonResponse({
+      error: "server_misconfigured",
+      error_description: "OAUTH_SIGNING_SECRET must be 32+ characters and OAUTH_USER_PASSWORD must be 20+ characters.",
+    }, 500);
+  }
+  if (env.OAUTH_CLIENT_SECRET.length < 32) {
+    return jsonResponse({
+      error: "server_misconfigured",
+      error_description: "OAUTH_CLIENT_SECRET must be at least 32 characters.",
+    }, 500);
+  }
   return null;
 }
 
 export default {
+  /** Routes OAuth, discovery, and MCP requests. */
   async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/debug-env") {
-      return jsonResponse({ error: "not_found" }, 404);
-    }
-
     const envError = validateEnv(env);
     if (envError) {
       return envError;
     }
 
-    if (url.pathname === "/authorize" && (request.method === "GET" || request.method === "POST")) {
-      return handleAuthorize(request, env);
+    try {
+      const url = new URL(request.url);
+      if (url.protocol !== "https:" || url.origin !== env.OAUTH_PUBLIC_ORIGIN) {
+        return jsonResponse({ error: "invalid_request_origin" }, 400);
+      }
+      if (url.pathname === "/authorize" && (request.method === "GET" || request.method === "POST")) {
+        return handleAuthorize(request, env);
+      }
+      if (url.pathname === "/oauth/token" && request.method === "POST") {
+        return handleTokenRequest(request, env);
+      }
+      if (url.pathname === "/.well-known/oauth-authorization-server") {
+        return jsonResponse(getOAuthMetadata(env));
+      }
+      if (
+        url.pathname === "/.well-known/oauth-protected-resource"
+        || url.pathname === "/.well-known/oauth-protected-resource/mcp"
+      ) {
+        return jsonResponse(getProtectedResourceMetadata(env));
+      }
+      if (url.pathname === "/mcp") {
+        return handleMcpProxy(request, env);
+      }
+      return jsonResponse({ error: "not_found" }, 404);
+    } catch (error) {
+      console.error("Unhandled MCP OAuth proxy error", error);
+      return jsonResponse({ error: "server_error" }, 500);
     }
-
-    if (url.pathname === "/oauth/token" && request.method === "POST") {
-      return handleTokenRequest(request, env);
-    }
-
-    if (url.pathname === "/register") {
-      return handleRegistration(request, env);
-    }
-
-    if (url.pathname === "/.well-known/oauth-authorization-server") {
-      return jsonResponse(getOAuthMetadata(request));
-    }
-
-    if (url.pathname === "/.well-known/openid-configuration") {
-      return jsonResponse(getOAuthMetadata(request));
-    }
-
-    if (url.pathname === "/mcp") {
-      return handleMcpProxy(request, env);
-    }
-
-    return jsonResponse({ error: "not_found" }, 404);
   },
 };
