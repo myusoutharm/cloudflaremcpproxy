@@ -1,52 +1,34 @@
 # Cloudflare MCP OAuth Proxy
 
-Cloudflare Worker for confidential OAuth connections from Claude.ai and ChatGPT to an MCP server
-protected by Cloudflare Access. The Worker validates OAuth tokens, then presents a Cloudflare
-Access service token to the upstream MCP hostname.
+Minimal Cloudflare Worker for confidential OAuth connections from Claude.ai and ChatGPT to an MCP
+server protected by Cloudflare Access.
 
-This is a Cloudflare Worker project, not a Cloudflare Pages Functions project.
+The AI client authenticates with a preconfigured OAuth client ID and secret. The Worker validates
+the OAuth token and forwards MCP traffic with a Cloudflare Access service token. No database,
+Durable Object, approval page, or user password is required.
 
-## Architecture
-
-```mermaid
-flowchart LR
-    C[Claude or ChatGPT] -->|OAuth bearer token| W[Cloudflare Worker]
-    W -->|Access service token| A[Cloudflare Access]
-    A --> M[MCP origin]
-    W --> D[(OAuthState Durable Object)]
-```
-
-The SQLite-backed `OAuthState` Durable Object atomically consumes authorization codes, rotates
-refresh tokens, detects refresh-token replay, and rate-limits authorization password failures.
-Durable Objects are available on Cloudflare Workers Free and Paid plans.
-
-## Worker Configuration
+## Configuration
 
 Set these as Cloudflare dashboard text variables:
 
-- `MCP_ORIGIN`: protected upstream HTTPS origin, such as `https://mcp.example.com`. Do not include a
-  path.
-- `OAUTH_PUBLIC_ORIGIN`: public HTTPS origin of this Worker, such as
-  `https://mcp-api.example.com`. The Worker rejects alternate hosts and plaintext HTTP.
-- `CF_SERVICE_TOKEN_ID`: Cloudflare Access service-token client ID.
+- `MCP_ORIGIN`: protected upstream HTTPS origin, such as `https://mcp.example.com`.
+- `OAUTH_PUBLIC_ORIGIN`: exact public Worker origin without a trailing slash, such as
+  `https://mcp-api.example.com`.
 - `OAUTH_CLIENT_ID`: client ID entered in Claude or ChatGPT.
-- `OAUTH_ALLOWED_REDIRECT_URIS`: comma-separated exact HTTPS callback URLs.
+- `OAUTH_ALLOWED_REDIRECT_URIS`: comma-separated exact client callback URLs.
 
 Set these as encrypted Cloudflare secrets:
 
+- `CF_SERVICE_TOKEN_ID`: Cloudflare Access service-token client ID.
 - `CF_SERVICE_TOKEN_SECRET`: Cloudflare Access service-token secret.
-- `OAUTH_CLIENT_SECRET`: 32+ character confidential-client secret entered in Claude or ChatGPT.
-- `OAUTH_SIGNING_SECRET`: 32+ character random access-token signing secret.
-- `OAUTH_USER_PASSWORD`: 20+ character password entered on the authorization approval page.
+- `OAUTH_CLIENT_SECRET`: confidential-client secret entered in Claude or ChatGPT.
+- `OAUTH_SIGNING_SECRET`: 32+ character random token-signing secret.
 
-Do not configure `OAUTH_AUTO_APPROVE`. Every authorization requires the approval password.
-
-`wrangler.jsonc` declares the `OAUTH_STATE` Durable Object binding and uses `keep_vars: true` so a
-Workers Builds deployment does not remove dashboard variables and secrets.
+The Access application protecting `MCP_ORIGIN` must use a **Service Auth** policy that admits the
+configured Cloudflare service token. An identity-login policy would redirect the Worker and fail
+the MCP request.
 
 ## Client Settings
-
-Configure the Worker hostname, not the protected MCP origin:
 
 - MCP server URL: `https://mcp-api.example.com/mcp`
 - Authorization URL: `https://mcp-api.example.com/authorize`
@@ -54,36 +36,22 @@ Configure the Worker hostname, not the protected MCP origin:
 - OAuth client ID: value of `OAUTH_CLIENT_ID`
 - OAuth client secret: value of `OAUTH_CLIENT_SECRET`
 
-Dynamic client registration is intentionally unavailable because this deployment uses a
-preconfigured confidential-client secret. Current MCP protected-resource and authorization-server
-metadata are exposed through `/.well-known/*` for clients that perform discovery.
+The Worker supports `client_secret_basic` and `client_secret_post`. Dynamic registration is not
+provided because the AI clients are configured manually with the confidential credentials.
 
-Add each exact client callback to `OAUTH_ALLOWED_REDIRECT_URIS`. For example:
+## Security Model
 
-- Claude.ai: `https://claude.ai/api/mcp/auth_callback`
-- ChatGPT: use the exact callback URL shown during connector setup.
-
-## OAuth Behavior
-
-- Authorization code flow requires S256 PKCE, the confidential-client secret, and the exact MCP
-  resource identifier.
-- Token endpoints accept `client_secret_basic` and `client_secret_post` authentication.
-- Authorization codes are opaque, expire after five minutes, and can be exchanged once.
-- Replaying an authorization code or refresh token revokes its token family, including active
-  access tokens.
-- Access tokens expire after one hour and are audience-bound to the Worker's `/mcp` endpoint.
-- Client credentials flow is supported and does not issue refresh tokens.
-- Token responses are non-cacheable.
-- Failed approval-password attempts are limited to five per source IP in 15 minutes.
+- Authorization requests require an exact redirect URI, S256 PKCE, and the canonical MCP resource.
+- Token requests require the confidential-client secret.
+- Access tokens expire after one hour; refresh tokens expire after 30 days.
+- Tokens are stateless and cannot be individually revoked. Rotate `OAUTH_SIGNING_SECRET` to revoke
+  all issued tokens.
+- Authorization codes are valid for five minutes. Their practical replay protection is the
+  combination of PKCE and mandatory confidential-client authentication.
+- Cloudflare Access credentials and client bearer tokens are not forwarded across redirects.
 
 ## Deployment
 
-Use this folder as the project root in Cloudflare Workers Builds with GitHub integration. The first
-deployment provisions the SQLite-backed Durable Object declared under `exports` in
-`wrangler.jsonc`. Deploy with `wrangler deploy`; Durable Object lifecycle changes cannot be applied
-with `wrangler versions upload`, and current Wrangler rejects that command while `exports` is
-present. Disable Workers Builds for non-production branches or deploy preview branches to a
-separate Worker/environment using `wrangler deploy`.
-
-The Worker hostname must remain publicly reachable by the OAuth clients. Protect `MCP_ORIGIN` with
-a Cloudflare Access Service Auth policy that admits only the configured service token.
+Use this folder as a Cloudflare Workers Builds project root. `keep_vars: true` preserves dashboard
+variables and secrets during GitHub deployments. This project targets Cloudflare Workers, not Pages
+Functions.
