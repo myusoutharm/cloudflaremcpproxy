@@ -114,6 +114,20 @@ function isAllowedRedirectUri(redirectUri, env) {
   return isSecureRedirectUri(redirectUri) && getAllowedRedirectUris(env).includes(redirectUri);
 }
 
+/** Allows authorization posts from the Worker or configured OAuth client origins. */
+function isAllowedAuthorizationOrigin(requestOrigin, env) {
+  if (!requestOrigin || requestOrigin === env.OAUTH_PUBLIC_ORIGIN) {
+    return true;
+  }
+  return getAllowedRedirectUris(env).some((redirectUri) => {
+    try {
+      return new URL(redirectUri).origin === requestOrigin;
+    } catch {
+      return false;
+    }
+  });
+}
+
 /** Escapes text inserted into the authorization HTML page. */
 function escapeHtml(value) {
   return String(value)
@@ -354,9 +368,9 @@ function renderAuthorizePage(query) {
   <div class="card">
     <h1>Approve MCP Access</h1>
     <p>Enter the MCP authorization password to continue.</p>
-    <form method="post" action="/authorize">
+    <form method="post" action="/authorize" autocomplete="off">
       ${hiddenFields}
-      <label>Password <input type="password" name="user_password" required autocomplete="current-password"></label>
+      <label>Password <input type="password" name="user_password" required autocomplete="off" autocapitalize="none" spellcheck="false"></label>
       <button type="submit">Approve</button>
     </form>
   </div>
@@ -680,7 +694,7 @@ async function handleAuthorize(request, env) {
   let query = url.searchParams;
   if (request.method === "POST") {
     const requestOrigin = request.headers.get("Origin");
-    if (requestOrigin && requestOrigin !== env.OAUTH_PUBLIC_ORIGIN) {
+    if (!isAllowedAuthorizationOrigin(requestOrigin, env)) {
       return oauthErrorResponse("invalid_request", "Cross-origin authorization POST is not allowed.", 403);
     }
     const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
