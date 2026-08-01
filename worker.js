@@ -679,8 +679,9 @@ async function handleAuthorize(request, env) {
   const url = new URL(request.url);
   let query = url.searchParams;
   if (request.method === "POST") {
-    if (request.headers.get("Origin") !== env.OAUTH_PUBLIC_ORIGIN) {
-      return oauthErrorResponse("invalid_request", "Authorization POST must be same-origin.", 403);
+    const requestOrigin = request.headers.get("Origin");
+    if (requestOrigin && requestOrigin !== env.OAUTH_PUBLIC_ORIGIN) {
+      return oauthErrorResponse("invalid_request", "Cross-origin authorization POST is not allowed.", 403);
     }
     const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
     if (await getOAuthState(env).isPasswordBlocked(clientIp)) {
